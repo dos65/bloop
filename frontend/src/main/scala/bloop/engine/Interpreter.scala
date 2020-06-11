@@ -33,53 +33,59 @@ import bloop.engine.Dag.DagResult
 
 object Interpreter {
   // This is stack-safe because of Monix's trampolined execution
-  def execute(action: Action, stateTask: Task[State]): Task[State] = {
-    def execute(action: Action, stateTask: Task[State]): Task[State] = {
-      stateTask.flatMap { state =>
+  def execute(action: Action, stateTask: Task[WorkspaceState]): Task[WorkspaceState] = {
+    // commands in intepreter works over main state only
+    // except of `runBsp`
+    def executeOnMain(action: Action, workspaceState: WorkspaceState, stateTask: Task[State]): Task[WorkspaceState] =
+      execute(action, stateTask.map(st => workspaceState.copy(main = st)))
+
+    def execute(action: Action, stateTask: Task[WorkspaceState]): Task[WorkspaceState] = {
+      stateTask.flatMap { workspaceState =>
         action match {
           // We keep it case because there is a 'match may not be exhaustive' false positive by scalac
           // Looks related to existing bug report https://github.com/scala/bug/issues/10251
           case Exit(exitStatus: ExitStatus) if exitStatus.isOk =>
-            Task.now(state.mergeStatus(exitStatus))
-          case Exit(exitStatus: ExitStatus) => Task.now(state.mergeStatus(exitStatus))
+            Task.now(workspaceState.mergeStatus(exitStatus))
+          case Exit(exitStatus: ExitStatus) => Task.now(workspaceState.mergeStatus(exitStatus))
           case Print(msg, _, next) =>
-            state.logger.info(msg)
-            execute(next, Task.now(state))
+            workspaceState.logger.info(msg)
+            execute(next, Task.now(workspaceState))
           case Run(cmd: Commands.Bsp, _) =>
             val msg = "Internal error: The `bsp` command must be validated before use"
             val printAction = Print(msg, cmd.cliOptions.common, Exit(ExitStatus.UnexpectedError))
-            execute(printAction, Task.now(state))
+            execute(printAction, Task.now(workspaceState))
           case Run(cmd: Commands.ValidatedBsp, next) =>
-            execute(next, runBsp(cmd, state))
+            execute(next, runBsp(cmd, workspaceState))
           case Run(cmd: Commands.About, next) =>
-            notHandled("about", cmd.cliOptions, state)
+            notHandled("about", cmd.cliOptions, workspaceState)
           case Run(cmd: Commands.Help, next) =>
-            notHandled("help", cmd.cliOptions, state)
+            notHandled("help", cmd.cliOptions, workspaceState)
           case Run(cmd: Commands.Command, next) =>
+            val mainState = workspaceState.main
             // We validate for almost all commands coming from the CLI except for BSP and about,help
-            Validate.validateBuildForCLICommands(state, state.logger.error(_)).flatMap { state =>
+            Validate.validateBuildForCLICommands(mainState, workspaceState.logger.error(_)).flatMap { state =>
               // Don't continue the interpretation if a build-related error has been reported
-              if (state.status == ExitStatus.BuildDefinitionError) Task.now(state)
+              if (state.status == ExitStatus.BuildDefinitionError) Task.now(workspaceState.copy(main = state))
               else {
                 cmd match {
                   case cmd: Commands.Clean =>
-                    execute(next, clean(cmd, state))
+                    executeOnMain(next, workspaceState, clean(cmd, state))
                   case cmd: Commands.Compile =>
-                    execute(next, compile(cmd, state))
+                    executeOnMain(next, workspaceState, compile(cmd, state))
                   case cmd: Commands.Console =>
-                    execute(next, console(cmd, state))
+                    executeOnMain(next, workspaceState, console(cmd, state))
                   case cmd: Commands.Projects =>
-                    execute(next, showProjects(cmd, state))
+                    executeOnMain(next, workspaceState, showProjects(cmd, state))
                   case cmd: Commands.Test =>
-                    execute(next, test(cmd, state))
+                    executeOnMain(next, workspaceState, test(cmd, state))
                   case cmd: Commands.Run =>
-                    execute(next, run(cmd, state))
+                    executeOnMain(next, workspaceState, run(cmd, state))
                   case cmd: Commands.Configure =>
-                    execute(next, configure(cmd, state))
+                    executeOnMain(next, workspaceState, configure(cmd, state))
                   case cmd: Commands.Autocomplete =>
-                    execute(next, autocomplete(cmd, state))
+                    executeOnMain(next, workspaceState, autocomplete(cmd, state))
                   case cmd: Commands.Link =>
-                    execute(next, link(cmd, state))
+                    executeOnMain(next, workspaceState, link(cmd, state))
                 }
               }
             }
@@ -90,7 +96,7 @@ object Interpreter {
     execute(action, stateTask)
   }
 
-  private def notHandled(command: String, cliOptions: CliOptions, state: State): Task[State] = {
+  private def notHandled(command: String, cliOptions: CliOptions, state: WorkspaceState): Task[WorkspaceState] = {
     val msg = s"The handling of `$command` does not happen in the `Interpreter`"
     val printAction =
       Print(msg, cliOptions.common, Exit(ExitStatus.UnexpectedError))
@@ -103,7 +109,7 @@ object Interpreter {
   private def getProjectsDag(projects: List[Project], state: State): Dag[Project] =
     Aggregate(projects.map(p => state.build.getDagFor(p)))
 
-  private def runBsp(cmd: Commands.ValidatedBsp, state: State): Task[State] = {
+  private def runBsp(cmd: Commands.ValidatedBsp, state: WorkspaceState): Task[WorkspaceState] = {
     import ExecutionContext.{ioScheduler, scheduler}
     BspServer
       .run(cmd, state, RelativePath(".bloop"), None, None, scheduler, ioScheduler)
@@ -193,15 +199,12 @@ object Interpreter {
   private def showProjects(cmd: Commands.Projects, state: State): Task[State] = Task {
     import state.logger
     if (cmd.dotGraph) {
-      val stringToMainProjects =
-        state.build.mainOnlyProjects.map(lp => lp.project.name -> lp.project).toMap
-      val DagResult(dags, _, _) = Dag.fromMap(stringToMainProjects)
-      val contents = Dag.toDotGraph(dags)
+      val contents = Dag.toDotGraph(state.build.dags)
       logger.info(contents)
     } else {
       val configDirectory = state.build.origin.syntax
       logger.debug(s"Projects loaded from '$configDirectory':")(DebugFilter.All)
-      state.build.mainOnlyProjects.map(_.project.name).sorted.foreach(logger.info)
+      state.build.loadedProjects.map(_.project.name).sorted.foreach(logger.info)
     }
 
     state.mergeStatus(ExitStatus.Ok)
@@ -416,7 +419,7 @@ object Interpreter {
       case Mode.Projects =>
         Task {
           for {
-            loadedProject <- state.build.mainOnlyProjects
+            loadedProject <- state.build.loadedProjects
             project = loadedProject.project
             completion <- cmd.format.showProject(project)
           } state.logger.info(completion)

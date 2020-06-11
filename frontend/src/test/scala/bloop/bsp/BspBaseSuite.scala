@@ -8,7 +8,7 @@ import bloop.TestSchedulers
 import bloop.bsp.BloopBspDefinitions.BloopExtraBuildParams
 import bloop.cli.{BspProtocol, Commands}
 import bloop.dap.DebugTestClient
-import bloop.engine.{ExecutionContext, State}
+import bloop.engine.{ExecutionContext, State, WorkspaceState}
 import bloop.internal.build.BuildInfo
 import bloop.io.{AbsolutePath, RelativePath}
 import bloop.logging.{BspClientLogger, RecordingLogger}
@@ -566,7 +566,7 @@ abstract class BspBaseSuite extends BaseSuite with BspClientTest {
   }
 
   def openBspConnection[T](
-      state: State,
+      state: WorkspaceState,
       cmd: Commands.ValidatedBsp,
       configDirectory: AbsolutePath,
       logger: BspClientLogger[_],

@@ -6,7 +6,7 @@ import java.util.Locale
 
 import bloop.cli.Commands
 import bloop.data.ClientInfo
-import bloop.engine.{ExecutionContext, State}
+import bloop.engine.{ExecutionContext, State, WorkspaceState}
 import bloop.io.{AbsolutePath, RelativePath, ServerHandle}
 import bloop.logging.{BspClientLogger, DebugFilter}
 import bloop.sockets.UnixDomainServerSocket
@@ -28,15 +28,17 @@ import scala.concurrent.Promise
 import scala.meta.jsonrpc.{BaseProtocolMessage, LanguageClient, LanguageServer}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+
 import monix.execution.cancelables.AssignableCancelable
 import java.nio.file.NoSuchFileException
+
 import monix.reactive.subjects.BehaviorSubject
 
 object BspServer {
   private implicit val logContext: DebugFilter = DebugFilter.Bsp
 
   import Commands.ValidatedBsp
-  private def initServer(handle: ServerHandle, state: State): Task[ServerSocket] = {
+  private def initServer(handle: ServerHandle, state: WorkspaceState): Task[ServerSocket] = {
     state.logger.debug(s"Waiting for a connection at $handle...")
     val openSocket = handle.server
     Task(openSocket).doOnCancel(Task(openSocket.close()))
@@ -47,16 +49,16 @@ object BspServer {
 
   def run(
       cmd: ValidatedBsp,
-      state: State,
+      state: WorkspaceState,
       config: RelativePath,
       promiseWhenStarted: Option[Promise[Unit]],
-      externalObserver: Option[BehaviorSubject[State]],
+      externalObserver: Option[BehaviorSubject[WorkspaceState]],
       scheduler: Scheduler,
       ioScheduler: Scheduler
-  ): Task[State] = {
+  ): Task[WorkspaceState  ] = {
     import state.logger
 
-    def listenToConnection(handle: ServerHandle, serverSocket: ServerSocket): Task[State] = {
+    def listenToConnection(handle: ServerHandle, serverSocket: ServerSocket): Task[WorkspaceState] = {
       val isCommunicationActive = Atomic(true)
       val connectionURI = handle.uri
 
@@ -151,7 +153,7 @@ object BspServer {
             )
 
             // The code above should not throw, but move this code to a finalizer to be 100% sure
-            closeCommunication(externalObserver, latestState, socket, serverSocket)
+            closeCommunication(latestState, socket, serverSocket)
             ()
           }
         }
@@ -264,8 +266,7 @@ object BspServer {
   }
 
   def closeCommunication(
-      externalObserver: Option[BehaviorSubject[State]],
-      latestState: State,
+      latestState: WorkspaceState,
       socket: Socket,
       serverSocket: ServerSocket
   ): Unit = {
@@ -278,7 +279,7 @@ object BspServer {
       }
     } finally {
       // Guarantee that we always schedule the external classes directories deletion
-      val deleteExternalDirsTasks = latestState.build.loadedProjects.map { loadedProject =>
+      val deleteExternalDirsTasks = latestState.allLoadedProjects.map { loadedProject =>
         import bloop.io.Paths
         val project = loadedProject.project
         try {

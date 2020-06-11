@@ -333,16 +333,8 @@ object Cli {
     val configDir = configDirectory.underlying
     waitUntilEndOfWorld(action, cliOptions, pool, configDir, logger, cancel) {
       val taskToInterpret = { (cli: CliClientInfo) =>
-        val state = State.loadActiveStateFor(configDirectory, cli, pool, cliOptions.common, logger)
-        Interpreter.execute(action, state).map { newState =>
-          action match {
-            case Run(_: Commands.ValidatedBsp, _) =>
-              () // Ignore, BSP services auto-update the build
-            case _ => State.stateCache.updateBuild(newState.copy(status = ExitStatus.Ok))
-          }
-
-          newState
-        }
+        val state = WorkspaceState.loadActiveStateFor(configDirectory, cli, pool, cliOptions.common, logger)
+        Interpreter.execute(action, state)
       }
 
       val session = runTaskWithCliClient(configDirectory, action, taskToInterpret, pool, logger)
@@ -366,7 +358,7 @@ object Cli {
   def runTaskWithCliClient(
       configDir: AbsolutePath,
       action: Action,
-      processCliTask: CliClientInfo => Task[State],
+      processCliTask: CliClientInfo => Task[WorkspaceState],
       pool: ClientPool,
       logger: Logger
   ): CliSession = {

@@ -2,16 +2,8 @@ package bloop
 
 import bloop.data.ClientInfo
 import bloop.cli.{CliOptions, Commands, ExitStatus}
-import bloop.cli.CliParsers.{
-  cliParser,
-  coParser,
-  inputStreamRead,
-  pathParser,
-  printStreamRead,
-  propertiesParser,
-  OptionsParser
-}
-import bloop.engine.{Action, Build, BuildLoader, Exit, Interpreter, NoPool, Print, Run, State}
+import bloop.cli.CliParsers.{OptionsParser, cliParser, coParser, inputStreamRead, pathParser, printStreamRead, propertiesParser}
+import bloop.engine.{Action, Build, BuildLoader, ExecutionContext, Exit, Interpreter, NoPool, Print, Run, State, WorkspaceState}
 import bloop.engine.tasks.Tasks
 import bloop.io.AbsolutePath
 import bloop.logging.BloopLogger
@@ -19,8 +11,10 @@ import caseapp.{CaseApp, RemainingArgs}
 import jline.console.ConsoleReader
 import _root_.monix.eval.Task
 import bloop.data.WorkspaceSettings
+
 import scala.annotation.tailrec
-import scala.concurrent.Promise
+import scala.concurrent.duration.Duration
+import scala.concurrent.{Await, Promise}
 
 object Bloop extends CaseApp[CliOptions] {
   private val reader = consoleReader()
@@ -35,28 +29,31 @@ object Bloop extends CaseApp[CliOptions] {
     )
     logger.warn("Please refer to our documentation for more information.")
     val client = ClientInfo.CliClientInfo(useStableCliDirs = true, () => true)
-    val loadedProjects = BuildLoader.loadSynchronously(configDirectory, logger)
     val workspaceSettings = WorkspaceSettings.readFromFile(configDirectory, logger)
-    val build = Build(configDirectory, loadedProjects, workspaceSettings)
-    val state = State(build, client, NoPool, options.common, logger)
+    val state = WorkspaceState.loadSynchronously(
+      configDirectory,
+      client,
+      NoPool,
+      options.common,
+      logger,
+      workspaceSettings
+    )
     run(state, options)
   }
 
   @tailrec
-  def run(state: State, options: CliOptions): Unit = {
-    val origin = state.build.origin
+  def run(state: WorkspaceState, options: CliOptions): Unit = {
+    val origin = state.main.build.origin
     val config = origin.underlying
-    def waitForState(a: Action, t: Task[State]): State = {
+    def waitForState(a: Action, t: Task[WorkspaceState]): WorkspaceState = {
       // Ignore the exit status here, all we want is the task to finish execution or fail.
       Cli.waitUntilEndOfWorld(a, options, state.pool, config, state.logger) {
-        t.map(s => { State.stateCache.updateBuild(s.copy(status = ExitStatus.Ok)); s.status })
+        t.map(_ => ExitStatus.Ok)
       }
 
       // Recover the state if the previous task has been successful.
-      State.stateCache
-        .getStateFor(origin, state.client, state.pool, options.common, state.logger)
+      WorkspaceState.fromCache(origin, state.client, state.pool, options.common, state.logger)
         .getOrElse(state)
-
     }
 
     val input = reader.readLine()
@@ -71,7 +68,7 @@ object Bloop extends CaseApp[CliOptions] {
         run(waitForState(action, Interpreter.execute(action, Task.now(state))), options)
 
       case Array("clean") =>
-        val allProjects = state.build.loadedProjects.map(_.project.name)
+        val allProjects = state.main.build.loadedProjects.map(_.project.name)
         val action = Run(Commands.Clean(allProjects), Exit(ExitStatus.Ok))
         run(waitForState(action, Interpreter.execute(action, Task.now(state))), options)
 

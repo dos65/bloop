@@ -9,17 +9,7 @@ import scala.concurrent.duration.Duration
 import bloop.cli.{Commands, ExitStatus}
 import bloop.config.Config
 import bloop.data.{LoadedProject, Origin, Project, WorkspaceSettings}
-import bloop.engine.{
-  Action,
-  Build,
-  BuildLoader,
-  Dag,
-  ExecutionContext,
-  Exit,
-  Interpreter,
-  Run,
-  State
-}
+import bloop.engine.{Action, Build, BuildLoader, Dag, ExecutionContext, Exit, Interpreter, Run, State, WorkspaceState}
 import bloop.engine.caches.ResultsCache
 import bloop.io.AbsolutePath
 import bloop.logging.{BloopLogger, Logger, NoopLogger}
@@ -90,13 +80,20 @@ abstract class CommunityBuild(val buildpressHomeDir: AbsolutePath) {
     new CompilerCache(provider, jars, NoopLogger, Nil, None, None, scheduler)
   }
 
-  def loadStateForBuild(configDirectory: AbsolutePath, logger: Logger): State = {
+  def loadStateForBuild(configDirectory: AbsolutePath, logger: Logger): WorkspaceState = {
     assert(configDirectory.exists, "Does not exist: " + configDirectory)
-    val loadedProjects = BuildLoader.loadSynchronously(configDirectory, logger)
     val workspaceSettings = WorkspaceSettings.readFromFile(configDirectory, logger)
-    val build = Build(configDirectory, loadedProjects, workspaceSettings)
-    val state = State.forTests(build, compilerCache, logger)
-    state.copy(results = ResultsCache.emptyForTests)
+    val state = WorkspaceState.loadSynchronouslyForTests(
+      configDirectory,
+      compilerCache,
+      logger,
+      workspaceSettings
+    )
+
+    state.copy(
+      main = state.main.copy(results = ResultsCache.emptyForTests),
+      meta = state.meta.map(_.copy(results = ResultsCache.emptyForTests))
+    )
   }
 
   def compileProject(buildBaseDir: AbsolutePath): Unit = {
@@ -116,7 +113,7 @@ abstract class CommunityBuild(val buildpressHomeDir: AbsolutePath) {
       val logger = BloopLogger.default("community-build-logger")
       val initialState = loadStateForBuild(buildBaseDir.resolve(".bloop"), logger)
       val blacklistedProjects = readBlacklistFile(buildBaseDir.resolve("blacklist.buildpress"))
-      val allProjectsInBuild = initialState.build.loadedProjects
+      val allProjectsInBuild = initialState.main.build.loadedProjects
         .filterNot(lp => blacklistedProjects.contains(lp.project.name))
 
       val rootProjectName = "bloop-test-root"
@@ -151,15 +148,19 @@ abstract class CommunityBuild(val buildpressHomeDir: AbsolutePath) {
       )
 
       val newLoaded = LoadedProject.RawProject(rootProject) :: allProjectsInBuild
-      val state = initialState.copy(build = initialState.build.copy(loadedProjects = newLoaded))
-      val allReachable = Dag.dfs(state.build.getDagFor(rootProject))
+
+      val updateMain = initialState.main.copy(
+        build = initialState.main.build.copy(loadedProjects = newLoaded)
+      )
+      val state = initialState.copy(main = updateMain)
+      val allReachable = Dag.dfs(state.main.build.getDagFor(rootProject))
       val reachable = allReachable.filter(_ != rootProject)
       val cleanAction = Run(Commands.Clean(reachable.map(_.name)), Exit(ExitStatus.Ok))
       val cleanedState = execute(cleanAction, state)
 
       reachable.foreach { project =>
         removeClassFiles(project)
-        if (hasCompileAnalysis(project, cleanedState)) {
+        if (hasCompileAnalysis(project, cleanedState.main)) {
           System.err.println(s"Project ${project.baseDirectory} already compiled!")
           exit(1)
         }
@@ -184,7 +185,7 @@ abstract class CommunityBuild(val buildpressHomeDir: AbsolutePath) {
           bloop.io.Paths.pathFilesUnder(dir, "glob:**.{scala,java}").nonEmpty
         }
 
-        if (projectHasSources && !hasCompileAnalysis(project, compiledState)) {
+        if (projectHasSources && !hasCompileAnalysis(project, compiledState.main)) {
           System.err.println(s"Project ${project.baseDirectory} was not compiled!")
           exit(1)
         }
@@ -204,7 +205,7 @@ abstract class CommunityBuild(val buildpressHomeDir: AbsolutePath) {
     }
   }
 
-  private def execute(a: Action, state: State, duration: Duration = Duration.Inf): State = {
+  private def execute(a: Action, state: WorkspaceState, duration: Duration = Duration.Inf): WorkspaceState = {
     val task = Interpreter.execute(a, Task.now(state))
     val handle = task.runAsync(ExecutionContext.scheduler)
     try Await.result(handle, duration)

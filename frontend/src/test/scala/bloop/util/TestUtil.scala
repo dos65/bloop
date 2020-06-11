@@ -7,27 +7,18 @@ import java.nio.file.{Files, Path, Paths}
 import java.util.concurrent.TimeUnit
 
 import bloop.{CompilerCache, ScalaInstance}
-import bloop.cli.Commands
+import bloop.cli.{Commands, CommonOptions, ExitStatus}
 import bloop.config.Config
 import bloop.config.Config.CompileOrder
-import bloop.data.{ClientInfo, Origin, Project, JdkConfig}
-import bloop.engine.{Action, Build, BuildLoader, ExecutionContext, Interpreter, Run, State}
+import bloop.data.{ClientInfo, JdkConfig, Origin, Project}
+import bloop.engine.{Action, Build, BuildLoader, ExecutionContext, Interpreter, NoPool, Run, State, WorkspaceState}
 import bloop.engine.caches.ResultsCache
 import bloop.internal.build.BuildInfo
 import bloop.io.Paths.delete
 import bloop.io.{AbsolutePath, RelativePath}
-import bloop.logging.{
-  BloopLogger,
-  BspClientLogger,
-  BufferedLogger,
-  DebugFilter,
-  Logger,
-  RecordingLogger
-}
-
+import bloop.logging.{BloopLogger, BspClientLogger, BufferedLogger, DebugFilter, Logger, RecordingLogger}
 import _root_.monix.eval.Task
 import _root_.monix.execution.Scheduler
-
 import org.junit.Assert
 import sbt.internal.inc.bloop.ZincInternals
 
@@ -93,7 +84,7 @@ object TestUtil {
       failure: Boolean = false,
       useSiteLogger: Option[Logger] = None,
       order: CompileOrder = Config.Mixed
-  )(afterCompile: State => Unit = (_ => ())) = {
+  )(afterCompile: WorkspaceState => Unit = (_ => ())) = {
     testState(structures, dependencies, scalaInstance, jdkConfig, order) { (state: State) =>
       def action(state0: State): Unit = {
         val state = useSiteLogger.map(logger => state0.copy(logger = logger)).getOrElse(state0)
@@ -140,7 +131,7 @@ object TestUtil {
     await(duration, ExecutionContext.scheduler)(t)
   }
 
-  def interpreterTask(a: Action, state: State): Task[State] = {
+  def interpreterTask(a: Action, state: WorkspaceState): Task[WorkspaceState] = {
     Interpreter.execute(a, Task.now(state))
   }
 
@@ -164,7 +155,7 @@ object TestUtil {
     }
   }
 
-  def blockingExecute(a: Action, state: State, duration: Duration = Duration.Inf): State = {
+  def blockingExecute(a: Action, state: WorkspaceState, duration: Duration = Duration.Inf): WorkspaceState = {
     val handle = interpreterTask(a, state).runAsync(ExecutionContext.scheduler)
     try Await.result(handle, duration)
     catch {
@@ -203,24 +194,24 @@ object TestUtil {
 
   private final val ThisClassLoader = this.getClass.getClassLoader
 
-  def loadTestProject(buildName: String): State = {
+  def loadTestProject(buildName: String): WorkspaceState = {
     val configDir = getBloopConfigDir(buildName)
     val logger = BloopLogger.default(configDir.toString())
     loadTestProject(configDir, logger, true)
   }
 
-  def loadTestProject(buildName: String, logger: Logger): State =
+  def loadTestProject(buildName: String, logger: Logger): WorkspaceState =
     loadTestProject(getBloopConfigDir(buildName), logger, true)
 
-  def loadTestProject(configDir: Path): State = {
+  def loadTestProject(configDir: Path): WorkspaceState = {
     val logger = BloopLogger.default(configDir.toString())
     loadTestProject(configDir, logger, false)
   }
 
-  def loadTestProject(configDir: Path, logger: Logger): State =
+  def loadTestProject(configDir: Path, logger: Logger): WorkspaceState =
     loadTestProject(configDir, logger, false, identity[List[Project]] _)
 
-  def loadTestProject(configDir: Path, logger: Logger, emptyResults: Boolean): State =
+  def loadTestProject(configDir: Path, logger: Logger, emptyResults: Boolean): WorkspaceState =
     loadTestProject(configDir, logger, emptyResults, identity[List[Project]] _)
 
   def loadTestProject(
@@ -228,7 +219,7 @@ object TestUtil {
       logger: Logger,
       emptyResults: Boolean,
       transformProjects: List[Project] => List[Project]
-  ): State = {
+  ): WorkspaceState = {
     assert(Files.exists(configDir), "Does not exist: " + configDir)
 
     val configDirectory = AbsolutePath(configDir)
@@ -246,8 +237,23 @@ object TestUtil {
     val workspaceSettings = WorkspaceSettings.readFromFile(configDirectory, logger)
     val build = Build(configDirectory, transformedProjects, workspaceSettings)
     val state = State.forTests(build, TestUtil.getCompilerCache(logger), logger)
+//    val state = WorkspaceState.loadSynchronouslyForTests(
+//      configDirectory,
+//      TestUtil.getCompilerCache(logger),
+//      logger,
+//      workspaceSettings
+//    )
     val state1 = state.copy(commonOptions = state.commonOptions.copy(env = runAndTestProperties))
-    if (!emptyResults) state1 else state1.copy(results = ResultsCache.emptyForTests)
+    val state2 = if (!emptyResults) state1 else state1.copy(results = ResultsCache.emptyForTests)
+    WorkspaceState(
+      state2,
+      List.empty,
+      ClientInfo.CliClientInfo(useStableCliDirs = true, () => true),
+      NoPool,
+      CommonOptions.default,
+      logger,
+      ExitStatus.Ok
+    )
   }
 
   private[bloop] final val runAndTestProperties = {
@@ -288,7 +294,7 @@ object TestUtil {
    * @param cmd   The command to execute.
    * @param check A function that'll receive the resulting log messages.
    */
-  def runAndCheck(state: State, cmd: Commands.CompilingCommand)(
+  def runAndCheck(state: WorkspaceState, cmd: Commands.CompilingCommand)(
       check: List[(String, String)] => Unit
   ): Unit = {
     val recordingLogger = new RecordingLogger
@@ -311,7 +317,7 @@ object TestUtil {
       order: CompileOrder = Config.Mixed,
       userLogger: Option[Logger] = None,
       extraJars: Array[AbsolutePath] = Array()
-  )(op: State => T): T = {
+  )(op: WorkspaceState => T): T = {
     withinWorkspace { temp =>
       val logger = userLogger.getOrElse(BloopLogger.default(temp.toString))
       val projects = projectStructures.map {
@@ -593,7 +599,7 @@ object TestUtil {
     }
   }
 
-  def loadStateFromProjects(baseDir: AbsolutePath, projects: List[TestProject]): State = {
+  def loadStateFromProjects(baseDir: AbsolutePath, projects: List[TestProject]): WorkspaceState = {
     val configDir = TestProject.populateWorkspace(baseDir, projects)
     val logger = BloopLogger.default(configDir.toString())
     TestUtil.loadTestProject(configDir.underlying, logger, false, identity(_))

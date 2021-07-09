@@ -11,6 +11,7 @@ object Compat {
   val PluginData = sbt.PluginData
   val PluginDiscovery = sbt.PluginDiscovery
   val PluginManagement = sbt.PluginManagement
+  type UpdateReport = sbt.UpdateReport
 
   val bloopCompatSettings: Seq[Def.Setting[_]] = List()
 

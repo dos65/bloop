@@ -33,6 +33,7 @@ import xsbti.compile.CompileOrder
 import scala.util.{Try, Success, Failure}
 import java.util.concurrent.ConcurrentHashMap
 import java.nio.file.StandardCopyOption
+import sbt.TaskKey
 
 object BloopPlugin extends AutoPlugin {
   import sbt.plugins.JvmPlugin
@@ -146,6 +147,11 @@ object BloopDefaults {
       val bloopClassifiers = BloopKeys.bloopExportJarClassifiers.in(ThisBuild).value
       (if (bloopClassifiers.isEmpty) old else bloopClassifiers.get).toList
     },
+    Keys.transitiveClassifiers in Keys.updateSbtClassifiers := {
+      val old = (Keys.transitiveClassifiers in Keys.updateSbtClassifiers).value
+      val bloopClassifiers = BloopKeys.bloopExportJarClassifiers.in(ThisBuild).value
+      (if (bloopClassifiers.isEmpty) old else bloopClassifiers.get).toList
+    },
     BloopKeys.bloopIsMetaBuild := {
       val buildStructure = Keys.loadedBuild.value
       val baseDirectory = new File(buildStructure.root)
@@ -162,6 +168,7 @@ object BloopDefaults {
     },
     BloopKeys.bloopSupportedConfigurations := List(Compile, Test, IntegrationTest, Provided)
   ) ++ Offloader.bloopCompileGlobalSettings ++ Compat.bloopCompatSettings
+
 
   // From the infamous https://stackoverflow.com/questions/40741244/in-sbt-how-to-execute-a-command-in-task
   def runCommandAndRemaining(command: String): State => State = { st: State =>
@@ -697,11 +704,26 @@ object BloopDefaults {
     }
   }
 
-  lazy val updateClassifiers: Def.Initialize[Task[Option[sbt.UpdateReport]]] = Def.taskDyn {
+  lazy val updateClassifiers: Def.Initialize[Task[Seq[Config.Module]]] = Def.taskDyn {
     val runUpdateClassifiers = BloopKeys.bloopExportJarClassifiers.value.nonEmpty
-    if (!runUpdateClassifiers) Def.task(None)
-    else if (BloopKeys.bloopIsMetaBuild.value) Def.task(Some(Keys.updateSbtClassifiers.value))
-    else Def.task(Some(Keys.updateClassifiers.value))
+    if (!runUpdateClassifiers) Def.task(Seq.empty)
+    else if (BloopKeys.bloopIsMetaBuild.value)
+
+       Def.task{ 
+         val out1 = configModules((Keys.updateSbtClassifiers).value)
+         val out2 = configModules((Keys.updateClassifiers).value)
+         println(out1)
+         println()
+         println(out2)
+         out1 ++ out2
+       }
+    else {
+      Def.task {
+        println("------" + Keys.name.value)
+        val mainUpdate = Keys.updateClassifiers.value
+        configModules(mainUpdate)
+      }
+    }
   }
 
   import sbt.ModuleID
@@ -991,7 +1013,7 @@ object BloopDefaults {
 
           val binaryModules = configModules(Keys.update.value)
           val sourceModules = {
-            val sourceModulesFromSbt = updateClassifiers.value.toList.flatMap(configModules)
+            val sourceModulesFromSbt = updateClassifiers.value
             if (sourceModulesFromSbt.nonEmpty) sourceModulesFromSbt
             else {
               val previousAllModules =
